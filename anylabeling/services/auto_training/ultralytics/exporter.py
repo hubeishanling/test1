@@ -147,15 +147,9 @@ def validate_mnn_export_environment():
 
 
 def validate_ncnn_export_environment():
-    required_packages = ["ncnn"]
-    missing_packages = []
-    package_mapping = {"ncnn": "ncnn"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
+    """Validate environment for custom NCNN export (Android compatible)."""
+    from .ncnn_exporter import validate_ncnn_custom_export_environment
+    return validate_ncnn_custom_export_environment()
 
 
 def validate_imx500_export_environment():
@@ -236,7 +230,43 @@ class ExportManager:
         self.export_thread.start()
         return True, "Export started successfully"
 
-    def _export_worker(self, weights_path: str, export_format: str):
+    def start_export_file(
+        self, weights_path: str, export_format: str = "onnx", output_dir: str = None
+    ) -> Tuple[bool, str]:
+        """
+        Export a model file directly without requiring a project structure.
+
+        Args:
+            weights_path: Path to the .pt model file
+            export_format: Target export format
+            output_dir: Output directory (default: same as weights file)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        if self.is_exporting:
+            return False, "Export already in progress"
+
+        if not os.path.exists(weights_path):
+            return False, f"Model file not found: {weights_path}"
+
+        if not weights_path.endswith(".pt"):
+            return False, "Model file must be a .pt file"
+
+        if output_dir is None:
+            output_dir = os.path.dirname(weights_path)
+
+        self.is_exporting = True
+        self.export_thread = threading.Thread(
+            target=self._export_worker,
+            args=(weights_path, export_format, output_dir),
+        )
+        self.export_thread.start()
+        return True, "Export started successfully"
+
+    def _export_worker(
+        self, weights_path: str, export_format: str, output_dir: str = None
+    ):
         try:
             self.notify_callbacks(
                 "export_started",
@@ -282,66 +312,16 @@ class ExportManager:
             sys.stderr = log_redirector
 
             try:
-                from ultralytics import YOLO
-
-                self.notify_callbacks(
-                    "export_log",
-                    {"message": f"Loading model from {weights_path}"},
-                )
-                model = YOLO(weights_path)
-
-                self.notify_callbacks(
-                    "export_log",
-                    {
-                        "message": f"Starting export to {export_format} format..."
-                    },
-                )
-                results = model.export(format=export_format)
-
-                exported_path = (
-                    results if isinstance(results, str) else str(results)
-                )
-                if not exported_path:
-                    weights_dir = os.path.dirname(weights_path)
-                    model_name = os.path.splitext(
-                        os.path.basename(weights_path)
-                    )[0]
-                    exported_path = os.path.join(
-                        weights_dir, f"{model_name}.{export_format}"
-                    )
-
-                if os.path.exists(exported_path):
-                    self.notify_callbacks(
-                        "export_completed",
-                        {
-                            "exported_path": exported_path,
-                            "format": export_format,
-                        },
-                    )
+                # Use custom NCNN exporter for Android compatibility
+                if export_format == "ncnn":
+                    self._export_ncnn_android(weights_path, output_dir)
                 else:
-                    possible_path = weights_path.replace(
-                        ".pt", f".{export_format}"
-                    )
-                    if os.path.exists(possible_path):
-                        self.notify_callbacks(
-                            "export_completed",
-                            {
-                                "exported_path": possible_path,
-                                "format": export_format,
-                            },
-                        )
-                    else:
-                        self.notify_callbacks(
-                            "export_error",
-                            {
-                                "error": "Export completed but output file not found"
-                            },
-                        )
+                    self._export_standard(weights_path, export_format, output_dir)
 
             except ImportError as e:
                 self.notify_callbacks(
                     "export_error",
-                    {"error": f"Failed to import ultralytics: {str(e)}"},
+                    {"error": f"Failed to import required module: {str(e)}"},
                 )
             except Exception as e:
                 self.notify_callbacks(
@@ -358,6 +338,83 @@ class ExportManager:
             )
         finally:
             self.is_exporting = False
+
+    def _export_ncnn_android(self, weights_path: str, output_dir: str = None):
+        """Export model to NCNN format compatible with Android (RichAuto format)."""
+        from .ncnn_exporter import export_ncnn_for_android
+
+        def log_callback(message: str):
+            self.notify_callbacks("export_log", {"message": message})
+
+        self.notify_callbacks(
+            "export_log",
+            {"message": "Starting custom NCNN export for Android..."},
+        )
+
+        if output_dir is None:
+            output_dir = os.path.dirname(weights_path)
+
+        param_path, bin_path = export_ncnn_for_android(
+            weights_path, output_dir, log_callback
+        )
+
+        self.notify_callbacks(
+            "export_completed",
+            {
+                "exported_path": param_path,
+                "format": "ncnn",
+                "additional_files": [bin_path],
+            },
+        )
+
+    def _export_standard(self, weights_path: str, export_format: str, output_dir: str = None):
+        """Standard export using ultralytics."""
+        from ultralytics import YOLO
+
+        self.notify_callbacks(
+            "export_log",
+            {"message": f"Loading model from {weights_path}"},
+        )
+        model = YOLO(weights_path)
+
+        self.notify_callbacks(
+            "export_log",
+            {"message": f"Starting export to {export_format} format..."},
+        )
+
+        # Build export kwargs
+        export_kwargs = {"format": export_format}
+        if output_dir:
+            # For some formats, we need to handle output directory differently
+            pass  # ultralytics handles output location automatically
+
+        results = model.export(**export_kwargs)
+
+        exported_path = results if isinstance(results, str) else str(results)
+        if not exported_path:
+            weights_dir = output_dir or os.path.dirname(weights_path)
+            model_name = os.path.splitext(os.path.basename(weights_path))[0]
+            exported_path = os.path.join(
+                weights_dir, f"{model_name}.{export_format}"
+            )
+
+        if os.path.exists(exported_path):
+            self.notify_callbacks(
+                "export_completed",
+                {"exported_path": exported_path, "format": export_format},
+            )
+        else:
+            possible_path = weights_path.replace(".pt", f".{export_format}")
+            if os.path.exists(possible_path):
+                self.notify_callbacks(
+                    "export_completed",
+                    {"exported_path": possible_path, "format": export_format},
+                )
+            else:
+                self.notify_callbacks(
+                    "export_error",
+                    {"error": "Export completed but output file not found"},
+                )
 
     def stop_export(self) -> bool:
         if not self.is_exporting:

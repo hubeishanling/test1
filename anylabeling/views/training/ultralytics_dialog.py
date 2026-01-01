@@ -380,6 +380,11 @@ class UltralyticsDialog(QDialog):
         self.load_images_button = SecondaryButton(self.tr("Load Images"))
         self.load_images_button.clicked.connect(self.load_images)
         actions_layout.addWidget(self.load_images_button)
+
+        self.convert_model_button = SecondaryButton(self.tr("Convert Model"))
+        self.convert_model_button.clicked.connect(self.convert_model_file)
+        actions_layout.addWidget(self.convert_model_button)
+
         actions_layout.addStretch()
 
         self.next_button = PrimaryButton(self.tr("Next"))
@@ -1900,6 +1905,52 @@ class UltralyticsDialog(QDialog):
             export_format = export_dialog.get_selected_format()
             success, message = self.export_manager.start_export(
                 self.current_project_path, export_format
+            )
+            if not success:
+                QMessageBox.critical(self, self.tr("Export Error"), message)
+                self.append_training_log(f"Failed to start export: {message}")
+
+    def convert_model_file(self):
+        """Convert a model file directly without requiring training first."""
+        # Select model file
+        weights_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr("Select Model File to Convert"),
+            "",
+            "PyTorch Model (*.pt);;All Files (*)",
+        )
+        if not weights_path:
+            return
+
+        # Select output directory
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            self.tr("Select Output Directory"),
+            os.path.dirname(weights_path),
+        )
+        if not output_dir:
+            output_dir = os.path.dirname(weights_path)
+
+        # Select export format
+        export_dialog = ExportFormatDialog(self)
+        if export_dialog.exec_() == QDialog.Accepted:
+            export_format = export_dialog.get_selected_format()
+
+            # Switch to train tab to show logs
+            self.go_to_specific_tab(2)
+
+            # Clear previous logs
+            if hasattr(self, "log_display"):
+                self.log_display.clear()
+
+            self.append_training_log(
+                f"Starting model conversion: {weights_path}"
+            )
+            self.append_training_log(f"Output directory: {output_dir}")
+            self.append_training_log(f"Target format: {export_format}")
+
+            success, message = self.export_manager.start_export_file(
+                weights_path, export_format, output_dir
             )
             if not success:
                 QMessageBox.critical(self, self.tr("Export Error"), message)
