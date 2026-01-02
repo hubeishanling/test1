@@ -8,7 +8,7 @@ class ExportFormatDialog(QDialog):
         self.setWindowTitle(self.tr("Export Settings"))
         self.setFixedSize(400, 220)
         self.setModal(True)
-        self.selected_format = "onnx"
+        self.selected_format = "ncnn"
 
         layout = QVBoxLayout()
         layout.setSpacing(8)
@@ -22,20 +22,20 @@ class ExportFormatDialog(QDialog):
 
         self.format_combo = CustomComboBox()
         formats = [
-            ("ONNX", "onnx"),
-            ("TorchScript", "torchscript"),
-            ("OpenVINO", "openvino"),
-            ("TensorRT", "engine"),
-            ("CoreML", "coreml"),
-            ("TensorFlow SavedModel", "saved_model"),
-            ("TensorFlow Lite", "tflite"),
-            ("TensorFlow Edge TPU", "edgetpu"),
-            ("TensorFlow.js", "tfjs"),
-            ("PaddlePaddle", "paddle"),
-            ("MNN", "mnn"),
             ("NCNN", "ncnn"),
-            ("IMX500", "imx"),
-            ("RKNN", "rknn"),
+            ("ONNX", "onnx"),
+            # ("TorchScript", "torchscript"),
+            # ("OpenVINO", "openvino"),
+            # ("TensorRT", "engine"),
+            # ("CoreML", "coreml"),
+            # ("TensorFlow SavedModel", "saved_model"),
+            # ("TensorFlow Lite", "tflite"),
+            # ("TensorFlow Edge TPU", "edgetpu"),
+            # ("TensorFlow.js", "tfjs"),
+            # ("PaddlePaddle", "paddle"),
+            # ("MNN", "mnn"),
+            # ("IMX500", "imx"),
+            # ("RKNN", "rknn"),
         ]
 
         for display_name, format_code in formats:

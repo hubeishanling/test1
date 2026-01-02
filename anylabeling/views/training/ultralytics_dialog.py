@@ -409,6 +409,10 @@ class UltralyticsDialog(QDialog):
 
         self.init_actions(layout)
 
+        # Default select Detect task type
+        if "Detect" in self.task_type_buttons:
+            self.on_task_type_selected("Detect")
+
     # Config Tab
     def browse_model_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -556,7 +560,7 @@ class UltralyticsDialog(QDialog):
 
         device_layout = QHBoxLayout()
         self.config_widgets["device"] = CustomComboBox()
-        self.config_widgets["device"].addItems(DEVICE_OPTIONS)
+        self.config_widgets["device"].addItems(get_device_options())
         self.device_checkboxes = QWidget()
         self.device_checkboxes.setVisible(False)
         self.config_widgets["device"].currentTextChanged.connect(

@@ -16,20 +16,21 @@ ICON_SIZE_NORMAL = (32, 32)
 ICON_SIZE_SMALL = (16, 16)
 
 # Task configuration
-TASK_TYPES = ["Classify", "Detect", "OBB", "Segment", "Pose"]
+TASK_TYPES = ["Detect"]
+# TASK_TYPES = ["Classify", "Detect", "OBB", "Segment", "Pose"]
 TASK_SHAPE_MAPPINGS = {
-    "Classify": ["flags"],
+    # "Classify": ["flags"],
     "Detect": ["rectangle"],
-    "OBB": ["rotation"],
-    "Segment": ["polygon"],
-    "Pose": ["point"],
+    # "OBB": ["rotation"],
+    # "Segment": ["polygon"],
+    # "Pose": ["point"],
 }
 TASK_LABEL_MAPPINGS = {
-    "Classify": "classify",
+    # "Classify": "classify",
     "Detect": "hbb",
-    "OBB": "obb",
-    "Segment": "seg",
-    "Pose": "pose",
+    # "OBB": "obb",
+    # "Segment": "seg",
+    # "Pose": "pose",
 }
 
 # Training configuration
@@ -102,43 +103,85 @@ TRAINING_STATUS_TEXTS = {
 }
 
 
-# Env Check
-def is_torch_available() -> bool:
-    try:
-        import torch
+# Env Check - Completely lazy, no torch import at module load time
+_torch_available = None
+_cuda_available = None
+_mps_available = None
 
-        return True
-    except ImportError:
-        return False
+
+def _setup_torch_dll_path():
+    """Setup DLL path for torch before importing"""
+    import sys
+    if sys.platform == 'win32' and getattr(sys, 'frozen', False):
+        import os
+        base_path = sys._MEIPASS
+        torch_lib_path = os.path.join(base_path, 'torch', 'lib')
+        if os.path.exists(torch_lib_path):
+            os.environ['PATH'] = torch_lib_path + os.pathsep + os.environ.get('PATH', '')
+            if hasattr(os, 'add_dll_directory'):
+                try:
+                    os.add_dll_directory(torch_lib_path)
+                except Exception:
+                    pass
+
+
+def is_torch_available() -> bool:
+    global _torch_available
+    if _torch_available is None:
+        try:
+            _setup_torch_dll_path()
+            import torch
+            _torch_available = True
+        except Exception:
+            _torch_available = False
+    return _torch_available
 
 
 def is_cuda_available() -> bool:
-    try:
-        import torch
-
-        return torch.cuda.is_available() if is_torch_available() else False
-    except ImportError:
-        return False
+    global _cuda_available
+    if _cuda_available is None:
+        try:
+            if is_torch_available():
+                import torch
+                _cuda_available = torch.cuda.is_available()
+            else:
+                _cuda_available = False
+        except Exception:
+            _cuda_available = False
+    return _cuda_available
 
 
 def is_mps_available() -> bool:
+    global _mps_available
+    if _mps_available is None:
+        try:
+            if is_torch_available():
+                import torch
+                _mps_available = torch.backends.mps.is_available()
+            else:
+                _mps_available = False
+        except Exception:
+            _mps_available = False
+    return _mps_available
+
+
+def get_device_options():
+    """Get available device options - called at runtime"""
+    options = []
     try:
-        import torch
+        if is_cuda_available():
+            options.append("cuda")
+        if is_mps_available():
+            options.append("mps")
+    except Exception:
+        pass
+    options.append("cpu")
+    return options
 
-        return (
-            torch.backends.mps.is_available()
-            if is_torch_available()
-            else False
-        )
-    except ImportError:
-        return False
 
-
-IS_TORCH_AVAILABLE = is_torch_available()
-IS_CUDA_AVAILABLE = is_cuda_available()
-IS_MPS_AVAILABLE = is_mps_available()
-DEVICE_OPTIONS = (
-    (["cuda"] if IS_CUDA_AVAILABLE else [])
-    + (["mps"] if IS_MPS_AVAILABLE else [])
-    + ["cpu"]
-)
+# DO NOT call these at module load time!
+# Use the functions instead: is_torch_available(), is_cuda_available(), etc.
+IS_TORCH_AVAILABLE = None
+IS_CUDA_AVAILABLE = None
+IS_MPS_AVAILABLE = None
+DEVICE_OPTIONS = ["cpu"]  # Default, use get_device_options() at runtime

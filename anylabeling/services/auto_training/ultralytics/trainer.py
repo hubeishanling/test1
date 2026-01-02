@@ -2,6 +2,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import time
 import threading
 from io import StringIO
@@ -64,143 +65,102 @@ class TrainingManager:
             return False, "Training is already in progress"
 
         try:
-            import sys
-
             self.total_epochs = train_args.get("epochs", 100)
             self.stop_event.clear()
 
-            script_content = f"""# -*- coding: utf-8 -*-
-import io
-import os
-import signal
-import sys
-import multiprocessing
-
-if sys.platform.startswith("win"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
-import matplotlib
-matplotlib.use('Agg')
-
-from ultralytics import YOLO
-
-def signal_handler(signum, frame):
-    print("Training interrupted by signal", flush=True)
-    sys.exit(1)
-
-
-if __name__ == "__main__":
-    if sys.platform.startswith("win"):
-        multiprocessing.set_start_method('spawn', force=True)
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    try:
-        model = YOLO({repr(train_args.pop("model"))})
-        train_args = {repr(train_args)}
-        train_args['verbose'] = False
-        train_args['show'] = False
-        results = model.train(**train_args)
-    except KeyboardInterrupt:
-        print("Training interrupted by user", flush=True)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Training error: {{e}}", flush=True)
-        sys.exit(1)
-"""
-
-            script_path = os.path.join(
-                train_args.get("project", "/tmp"), "train_script.py"
-            )
-            os.makedirs(os.path.dirname(script_path), exist_ok=True)
-
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(script_content)
+            # Store train_args for the training thread
+            self._train_args = train_args.copy()
 
             def run_training():
                 try:
+                    import matplotlib
+                    matplotlib.use('Agg')
+                    
+                    from ultralytics import YOLO
+                    
                     self.is_training = True
                     self.notify_callbacks(
                         "training_started", {"total_epochs": self.total_epochs}
                     )
 
-                    self.training_process = subprocess.Popen(
-                        [sys.executable, script_path],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        bufsize=1,
-                        preexec_fn=os.setsid if os.name != "nt" else None,
-                    )
-
-                    while True:
+                    model_path = self._train_args.pop("model")
+                    model = YOLO(model_path)
+                    
+                    # Set training args
+                    self._train_args['verbose'] = True
+                    self._train_args['show'] = False
+                    
+                    # Add callback to check for stop event
+                    def on_train_epoch_end(trainer):
                         if self.stop_event.is_set():
-                            self.training_process.terminate()
-                            try:
-                                self.training_process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                if os.name == "nt":
-                                    self.training_process.kill()
-                                else:
-                                    os.killpg(
-                                        os.getpgid(self.training_process.pid),
-                                        signal.SIGKILL,
-                                    )
-                            self.is_training = False
-                            self.notify_callbacks("training_stopped", {})
-                            return
-
-                        output = self.training_process.stdout.readline()
-                        if (
-                            output == ""
-                            and self.training_process.poll() is not None
-                        ):
-                            break
-                        if output:
-                            cleaned_output = output.strip()
-                            if cleaned_output:
-                                self.notify_callbacks(
-                                    "training_log", {"message": cleaned_output}
-                                )
-
-                    return_code = self.training_process.poll()
-                    self.is_training = False
-
-                    if return_code == 0:
+                            raise KeyboardInterrupt("Training stopped by user")
+                        # Log progress
+                        epoch = trainer.epoch + 1
+                        self.notify_callbacks(
+                            "training_log",
+                            {"message": f"Epoch {epoch}/{self.total_epochs} completed"}
+                        )
+                    
+                    model.add_callback("on_train_epoch_end", on_train_epoch_end)
+                    
+                    # Redirect stdout to capture training logs
+                    import io
+                    import contextlib
+                    
+                    class LogCapture(io.StringIO):
+                        def __init__(self, callback):
+                            super().__init__()
+                            self.callback = callback
+                        
+                        def write(self, text):
+                            if text.strip():
+                                self.callback("training_log", {"message": text.strip()})
+                            return super().write(text)
+                    
+                    log_capture = LogCapture(self.notify_callbacks)
+                    
+                    try:
+                        with contextlib.redirect_stdout(log_capture):
+                            results = model.train(**self._train_args)
+                        
+                        self.is_training = False
                         self.notify_callbacks(
                             "training_completed",
                             {"results": "Training completed successfully"},
                         )
-                    else:
+                    except KeyboardInterrupt:
+                        self.is_training = False
+                        self.notify_callbacks("training_stopped", {})
+                    except Exception as e:
+                        self.is_training = False
                         self.notify_callbacks(
                             "training_error",
-                            {
-                                "error": f"Training process exited with code {return_code}"
-                            },
+                            {"error": f"Training error: {str(e)}"}
                         )
 
                 except Exception as e:
                     self.is_training = False
                     self.notify_callbacks("training_error", {"error": str(e)})
-                finally:
-                    try:
-                        os.remove(script_path)
-                    except:
-                        pass
 
             def save_settings_config():
                 save_path = os.path.join(
-                    train_args["project"], train_args["name"]
+                    self._train_args.get("project", ""), 
+                    self._train_args.get("name", "")
                 )
                 save_file = os.path.join(save_path, "settings.json")
 
+                # Wait for directory to be created
+                timeout = 60
+                start_time = time.time()
                 while not os.path.exists(save_path):
+                    if time.time() - start_time > timeout:
+                        return
                     time.sleep(1)
 
-                shutil.copy2(SETTINGS_CONFIG_PATH, save_file)
+                try:
+                    shutil.copy2(SETTINGS_CONFIG_PATH, save_file)
+                except Exception:
+                    pass
 
             training_thread = threading.Thread(target=run_training)
             training_thread.daemon = True

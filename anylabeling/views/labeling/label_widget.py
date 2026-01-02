@@ -2682,9 +2682,7 @@ class LabelingWidget(LabelDialog):
 
     # Help
     def documentation(self):
-        url = (
-            "https://github.com/CVHub520/X-AnyLabeling/tree/main/docs"  # NOQA
-        )
+        url = "http://www.sanguoyr.top"
         utils.general.open_url(url)
 
     def about(self):

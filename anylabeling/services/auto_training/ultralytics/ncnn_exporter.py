@@ -23,18 +23,47 @@ import tempfile
 from typing import Callable, Optional, Tuple
 
 
+def get_pnnx_path() -> str:
+    """Get the path to pnnx executable, handling PyInstaller frozen environment."""
+    import sys
+    import shutil as sh
+    
+    # If running in PyInstaller bundle, check the bundle directory first
+    if getattr(sys, 'frozen', False):
+        # pnnx.exe should be in the same directory as the exe
+        bundle_dir = sys._MEIPASS
+        pnnx_in_bundle = os.path.join(bundle_dir, 'pnnx.exe')
+        if os.path.exists(pnnx_in_bundle):
+            return pnnx_in_bundle
+    
+    # Try to find pnnx in PATH
+    pnnx_path = sh.which('pnnx')
+    if pnnx_path:
+        return pnnx_path
+    
+    # Try pnnx.exe specifically on Windows
+    if sys.platform == 'win32':
+        pnnx_path = sh.which('pnnx.exe')
+        if pnnx_path:
+            return pnnx_path
+    
+    return None
+
+
 def check_pnnx_available() -> Tuple[bool, str]:
-    """Check if pnnx command is available in PATH."""
+    """Check if pnnx command is available."""
+    pnnx_path = get_pnnx_path()
+    if not pnnx_path:
+        return False, "pnnx command not found. Please install pnnx first."
+    
     try:
         result = subprocess.run(
-            ["pnnx", "--help"],
+            [pnnx_path, "--help"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         return True, ""
-    except FileNotFoundError:
-        return False, "pnnx command not found. Please install pnnx first."
     except subprocess.TimeoutExpired:
         return False, "pnnx command timed out."
     except Exception as e:
@@ -106,7 +135,11 @@ def run_pnnx_convert(
     if log_callback:
         log_callback(f"Running pnnx on {torchscript_path}")
 
-    cmd = ["pnnx", torchscript_path]
+    pnnx_path = get_pnnx_path()
+    if not pnnx_path:
+        raise RuntimeError("pnnx not found. Please ensure pnnx is installed.")
+
+    cmd = [pnnx_path, torchscript_path]
 
     if input_shapes:
         for shape in input_shapes:
@@ -207,17 +240,14 @@ def modify_pnnx_py_for_android(
 
     Changes the output from post-processed detection results to raw tensor
     format: [1, 8400, num_channels] where num_channels = 64 + num_classes
-
-    Based on the approach from model_converter.py - find torch.cat with dim=2
-    and work backwards to find the view operations.
+    
+    Based on model_converter.py reference implementation.
     """
     if log_callback:
         log_callback(f"Modifying {pnnx_py_path} for Android compatibility...")
 
-    with open(pnnx_py_path, "r", encoding="utf-8") as f:
+    with open(pnnx_py_path, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
-
-    content = "".join(lines)
 
     # Calculate expected channel count (64 for bbox regression + num_classes)
     num_channels = 64 + num_classes
@@ -231,17 +261,20 @@ def modify_pnnx_py_for_android(
     cat_line_idx = -1
     cat_line = None
     cat_var = None
+    cat_input_vars = []
 
     for i, line in enumerate(lines):
         if "torch.cat" in line and "dim=2" in line and "= torch.cat" in line:
             cat_line_idx = i
             cat_line = line
-            # Extract the output variable name
-            match = re.match(r"\s*(v_\d+)\s*=\s*torch\.cat", line)
+            # Extract the output variable name and input variables
+            match = re.match(r"\s*(v_\d+)\s*=\s*torch\.cat\(\((.*?)\),\s*dim=2\)", line)
             if match:
                 cat_var = match.group(1)
+                cat_input_vars = [v.strip() for v in match.group(2).split(",")]
             if log_callback:
                 log_callback(f"Found torch.cat at line {i + 1}: {line.strip()}")
+                log_callback(f"Cat output: {cat_var}, inputs: {cat_input_vars}")
             break
 
     if cat_line_idx == -1:
@@ -253,58 +286,37 @@ def modify_pnnx_py_for_android(
     # Get indentation from cat line
     indent = cat_line[: len(cat_line) - len(cat_line.lstrip())]
 
-    # Search backwards from cat line to find the three view operations
-    # Look for patterns like: v_XXX = v_YYY.view(1, channels, grid_size)
-    view_info = []
-
-    for j in range(cat_line_idx - 1, max(0, cat_line_idx - 15), -1):
+    # Search backwards to find the view/reshape operations for each input variable
+    # Look for patterns like: v_165 = v_142.view(1, 144, 6400) or v_165 = v_142.reshape(1, 145, 6400)
+    view_info = {}
+    
+    for j in range(cat_line_idx - 1, max(0, cat_line_idx - 30), -1):
         line_content = lines[j]
-        # Match: v_XXX = v_YYY.view(1, NUM, NUM)
-        match = re.search(
-            r"(v_\d+)\s*=\s*(v_\d+)\.view\(\s*1\s*,\s*(\d+)\s*,\s*(\d+)\s*\)",
-            line_content,
-        )
-        if match:
-            out_var = match.group(1)
-            in_var = match.group(2)
-            channels = int(match.group(3))
-            grid_size = match.group(4)
-
-            view_info.insert(
-                0,
-                {
-                    "line_idx": j,
-                    "out_var": out_var,
-                    "in_var": in_var,
-                    "channels": channels,
-                    "grid_size": grid_size,
-                    "original_line": line_content,
-                },
-            )
-
-            if log_callback:
-                log_callback(
-                    f"Found view at line {j + 1}: {out_var} = {in_var}.view(1, {channels}, {grid_size})"
+        for var_name in cat_input_vars:
+            # Support both .view() and .reshape() - newer PyTorch versions use reshape
+            if var_name not in view_info and var_name in line_content and (".view(" in line_content or ".reshape(" in line_content):
+                # Match: v_XXX = v_YYY.view(1, NUM, NUM) or v_XXX = v_YYY.reshape(1, NUM, NUM)
+                match = re.search(
+                    r"(v_\d+)\s*=\s*(v_\d+)\.(view|reshape)\(\s*1\s*,\s*(\d+)\s*,\s*(-?\d+)\s*\)",
+                    line_content,
                 )
-
-            if len(view_info) >= 3:
-                break
-
-    if len(view_info) < 3:
-        raise RuntimeError(
-            f"Could not find 3 view operations before torch.cat. "
-            f"Found {len(view_info)}. The model structure may not be supported."
-        )
-
-    # Take the last 3 (closest to cat)
-    view_info = view_info[-3:]
-
-    # Get the channel count from the first view (should be same for all)
-    detected_channels = view_info[0]["channels"]
+                if match and match.group(1) == var_name:
+                    view_info[var_name] = {
+                        "line_idx": j,
+                        "out_var": match.group(1),
+                        "in_var": match.group(2),
+                        "channels": match.group(4),  # Keep as string for now
+                        "grid_size": match.group(5),
+                        "original_line": line_content,
+                    }
+                    if log_callback:
+                        log_callback(
+                            f"Found {match.group(3)} for {var_name} at line {j + 1}: "
+                            f"dim={match.group(4)}"
+                        )
 
     if log_callback:
-        log_callback(f"Detected channels: {detected_channels}")
-        log_callback(f"View variables: {[v['out_var'] for v in view_info]}")
+        log_callback(f"Found {len(view_info)} view operations out of {len(cat_input_vars)} expected")
 
     # Find the return statement after cat
     return_line_idx = -1
@@ -316,31 +328,102 @@ def modify_pnnx_py_for_android(
     if return_line_idx == -1:
         raise RuntimeError("Could not find return statement after torch.cat")
 
-    # Build new lines
-    new_lines = []
+    if len(view_info) >= len(cat_input_vars):
+        # We found all view operations - use the standard approach
+        if log_callback:
+            log_callback("Using standard modification approach...")
+        
+        # Build new lines
+        new_lines = []
 
-    # Add all lines before the first view operation
-    start_idx = view_info[0]["line_idx"]
-    new_lines.extend(lines[:start_idx])
+        # Add all lines before the first view operation
+        start_idx = min(v["line_idx"] for v in view_info.values())
+        new_lines.extend(lines[:start_idx])
 
-    # Add modified view operations with transpose
-    for v in view_info:
-        new_line = (
-            f"{indent}{v['out_var']} = "
-            f"{v['in_var']}.view(1, {detected_channels}, -1).transpose(1, 2)\n"
-        )
-        new_lines.append(new_line)
+        # Add modified view operations with transpose
+        # Use the channel dimension from each view operation
+        for var_name in cat_input_vars:
+            v = view_info[var_name]
+            new_line = (
+                f"{indent}{v['out_var']} = "
+                f"{v['in_var']}.view(1, {v['channels']}, -1).transpose(1, 2)\n"
+            )
+            new_lines.append(new_line)
 
-    # Add modified cat operation (dim=1 instead of dim=2)
-    cat_vars = ", ".join([v["out_var"] for v in view_info])
-    cat_out = cat_var if cat_var else f"v_{int(view_info[-1]['out_var'].split('_')[1]) + 1}"
-    new_lines.append(f"{indent}{cat_out} = torch.cat(({cat_vars}), dim=1)\n")
+        # Add modified cat operation (dim=1 instead of dim=2)
+        new_lines.append(f"{indent}{cat_var} = torch.cat(({', '.join(cat_input_vars)}), dim=1)\n")
 
-    # Add return statement
-    new_lines.append(f"{indent}return {cat_out}\n")
+        # Add return statement
+        new_lines.append(f"{indent}return {cat_var}\n")
 
-    # Add remaining lines after return (class definitions, export functions, etc.)
-    new_lines.extend(lines[return_line_idx + 1 :])
+        # Add remaining lines after return (class definitions, export functions, etc.)
+        new_lines.extend(lines[return_line_idx + 1:])
+
+    else:
+        # Fallback: Try to find view operations by looking for .view(1, pattern
+        if log_callback:
+            log_callback("Using fallback modification approach...")
+        
+        # Look for any .view(1, or .reshape(1, operations near the cat line
+        view_lines_found = []
+        for j in range(max(0, cat_line_idx - 20), cat_line_idx):
+            line_content = lines[j]
+            if (".view(1," in line_content or ".reshape(1," in line_content) and "v_" in line_content and "=" in line_content:
+                match = re.search(
+                    r"(v_\d+)\s*=\s*(v_\d+)\.(view|reshape)\(\s*1\s*,\s*(\d+)\s*,",
+                    line_content,
+                )
+                if match:
+                    view_lines_found.append({
+                        "line_idx": j,
+                        "out_var": match.group(1),
+                        "in_var": match.group(2),
+                        "channels": match.group(4),
+                    })
+                    if log_callback:
+                        log_callback(f"Found {match.group(3)} at line {j + 1}: {match.group(1)} dim={match.group(4)}")
+        
+        if len(view_lines_found) >= 3:
+            # Use the last 3 view operations (they should be the ones feeding into cat)
+            view_lines_found = view_lines_found[-3:]
+            
+            # Build new lines
+            new_lines = []
+            start_idx = view_lines_found[0]["line_idx"]
+            new_lines.extend(lines[:start_idx])
+            
+            # Add modified view operations
+            for vl in view_lines_found:
+                new_line = (
+                    f"{indent}{vl['out_var']} = "
+                    f"{vl['in_var']}.view(1, {vl['channels']}, -1).transpose(1, 2)\n"
+                )
+                new_lines.append(new_line)
+            
+            # Add modified cat operation
+            out_vars = [vl['out_var'] for vl in view_lines_found]
+            new_lines.append(f"{indent}{cat_var} = torch.cat(({', '.join(out_vars)}), dim=1)\n")
+            new_lines.append(f"{indent}return {cat_var}\n")
+            
+            # Add remaining lines after return
+            new_lines.extend(lines[return_line_idx + 1:])
+        else:
+            # Last resort: just modify the cat line directly
+            if log_callback:
+                log_callback("Using minimal modification approach (transpose inputs)...")
+            
+            new_lines = lines[:cat_line_idx]
+            
+            # Add transpose for each input variable
+            for var in cat_input_vars:
+                new_lines.append(f"{indent}{var} = {var}.transpose(1, 2)\n")
+            
+            # Modified cat with dim=1
+            new_lines.append(f"{indent}{cat_var} = torch.cat(({', '.join(cat_input_vars)}), dim=1)\n")
+            new_lines.append(f"{indent}return {cat_var}\n")
+            
+            # Add remaining lines after return
+            new_lines.extend(lines[return_line_idx + 1:])
 
     # Write modified file
     with open(pnnx_py_path, "w", encoding="utf-8") as f:
@@ -417,10 +500,14 @@ def convert_to_final_ncnn(
     if log_callback:
         log_callback("Converting to final NCNN format...")
 
+    pnnx_path = get_pnnx_path()
+    if not pnnx_path:
+        raise RuntimeError("pnnx not found. Please ensure pnnx is installed.")
+
     work_dir = os.path.dirname(modified_pt_path)
 
     cmd = [
-        "pnnx",
+        pnnx_path,
         modified_pt_path,
         "inputshape=[1,3,640,640]",
         "inputshape2=[1,3,320,320]",
